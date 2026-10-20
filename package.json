@@ -1,0 +1,24 @@
+{
+  "name": "improved-jeopardy-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Commands for the nested Improved Jeopardy application",
+  "scripts": {
+    "dev": "npm --prefix Improved-Jeopardy-main run dev",
+    "start": "npm --prefix Improved-Jeopardy-main start",
+    "server": "npm --prefix Improved-Jeopardy-main run server",
+    "setup": "npm --prefix Improved-Jeopardy-main run setup",
+    "build": "npm --prefix Improved-Jeopardy-main run build",
+    "lint": "npm --prefix Improved-Jeopardy-main/Jeopardy run lint",
+    "test": "npm --prefix Improved-Jeopardy-main test",
+    "test:teams": "npm --prefix Improved-Jeopardy-main run test:teams",
+    "test:sockets": "npm --prefix Improved-Jeopardy-main run test:sockets",
+    "test:sync": "npm --prefix Improved-Jeopardy-main run test:sync",
+    "test:buzzer": "npm --prefix Improved-Jeopardy-main run test:buzzer",
+    "test:host-display": "npm --prefix Improved-Jeopardy-main run test:host-display",
+    "test:persistence": "npm --prefix Improved-Jeopardy-main run test:persistence",
+    "test:replay": "npm --prefix Improved-Jeopardy-main run test:replay",
+    "test:sharing": "npm --prefix Improved-Jeopardy-main run test:sharing",
+    "test:security": "npm --prefix Improved-Jeopardy-main run test:security"
+  }
+}

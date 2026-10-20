@@ -1,0 +1,665 @@
+const assert = require('node:assert/strict')
+const { spawn } = require('node:child_process')
+const { createHmac } = require('node:crypto')
+const path = require('node:path')
+const fs = require('node:fs/promises')
+const os = require('node:os')
+const { pathToFileURL } = require('node:url')
+
+// Exercise real HTTP routes against disposable disk fixtures, including API restarts.
+// JEOPARDY_DATA_DIR keeps all writes away from saved classroom games.
+const root = path.resolve(__dirname, '..')
+const secret = 'isolated-student-session-test'
+const fixture = (id, code) => ({ id, code, ownerId: 'fixture-host', game: {
+  title: id, teams: [{ id: 'red', name: 'Red' }],
+  categories: [{ id: 'science', title: 'Science', clues: [{ id: 'one', value: 100, question: 'Question', answer: 'Hidden answer' }] }],
+  finalJeopardy: { question: 'Final question', answer: 'Hidden final answer' },
+}, progress: { scores: { red: 100 }, usedClues: [] }, updatedAt: new Date().toISOString() })
+const fixtures = { games: { first: fixture('first', 'TEST01'), second: fixture('second', 'TEST02') } }
+fixtures.games.legacy = fixture('legacy', 'OLD001')
+delete fixtures.games.legacy.ownerId
+const bootstrap = `
+(async () => {
+const session = require('express-session');
+const { FileSessionStore } = await import('./Jeopardy/server/persistence.js');
+const original = FileSessionStore.prototype.get;
+FileSessionStore.prototype.get = function(id, callback) {
+ if (id === 'test-host' || id === 'other-host') return callback(null, { cookie: {originalMaxAge:60000, expires:new Date(Date.now()+60000).toISOString(), httpOnly:true, path:'/'}, user:{id: id === 'test-host' ? 'fixture-host' : 'other-host', name:'Fixture host'} });
+ if (id === 'expired') return callback(null, { cookie: {originalMaxAge:1, expires:new Date(Date.now()-60000).toISOString(), httpOnly:true, path:'/'}, student:{id:'expired',gameId:'first'} });
+ return original.call(this,id,callback);
+};
+await import('./Jeopardy/server/index.js');
+})().catch(error => { console.error(error); process.exitCode = 1 });
+`
+
+async function checkSockets({ base, host, otherHost, join, request, read }) {
+  const { io } = require('../Jeopardy/node_modules/socket.io-client')
+  const sockets = []
+  const waitFor = (socket, event, matches = () => true) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { socket.off(event, done); reject(new Error(`Timed out: ${event}`)) }, 5000)
+    const done = (data) => {
+      if (!matches(data)) return
+      clearTimeout(timer)
+      socket.off(event, done)
+      resolve(data)
+    }
+    socket.on(event, done)
+  })
+  const makeSocket = (cookie, gameId = 'first', role = 'student', options = {}) => {
+    const socket = io(base.replace(/\/api$/, ''), { autoConnect: false, forceNew: true, transports: ['websocket'], reconnectionDelay: 50, reconnectionDelayMax: 100, extraHeaders: { Cookie: cookie, Origin: 'http://localhost:5173' }, auth: { gameId, role, studentId: 'forged-student-id' }, ...options })
+    sockets.push(socket)
+    return socket
+  }
+  const connect = async (socket) => {
+    const ready = waitFor(socket, 'session:ready')
+    socket.connect()
+    return ready
+  }
+  const rejected = async (socket) => {
+    const error = waitFor(socket, 'connect_error')
+    socket.connect()
+    await error
+    assert.equal(socket.connected, false)
+    socket.disconnect()
+  }
+  const ack = (socket, event) => socket.timeout(5000).emitWithAck(event)
+  const first = await join('Socket student one')
+  const second = await join('Socket student two')
+  const elsewhere = await join('Other game student', 'TEST02')
+  try {
+    await rejected(makeSocket(''))
+    await rejected(makeSocket(first.cookie, 'first', 'host'))
+    await rejected(makeSocket(otherHost, 'first', 'host'))
+    await rejected(makeSocket(first.cookie, 'second'))
+    await rejected(makeSocket(first.cookie, 'missing'))
+    await rejected(makeSocket(first.cookie, 'first', 'student', { extraHeaders: { Cookie: first.cookie, Origin: 'https://untrusted.example' } }))
+    console.log('PASS: Socket.IO rejects anonymous clients, forged host roles, wrong games, missing games, and disallowed origins')
+    const hostSocket = makeSocket(host, 'first', 'host')
+    const one = makeSocket(first.cookie)
+    const two = makeSocket(second.cookie)
+    const other = makeSocket(elsewhere.cookie, 'second')
+    const members = await Promise.all([connect(hostSocket), connect(one), connect(two), connect(other)])
+    const leakedHostStates = []
+    one.on('host:state', (record) => leakedHostStates.push(record))
+    other.on('host:state', (record) => leakedHostStates.push(record))
+    assert.equal((await request('/games/first/host-display')).status, 401)
+    assert.equal((await request('/games/first/host-display', 'GET', undefined, first.cookie)).status, 401)
+    assert.equal((await request('/games/missing/host-display', 'GET', undefined, host)).status, 404)
+    const displaySocket = makeSocket(host, 'first', 'host')
+    const initialPrivate = waitFor(displaySocket, 'host:state')
+    await connect(displaySocket)
+    assert.equal((await initialPrivate).id, 'first')
+    assert.equal(members[1].studentId, first.body.student.id)
+    assert.equal(members[2].studentId, second.body.student.id)
+    const events = []
+    other.on('room:checked', (event) => events.push(event))
+    const arrivals = [waitFor(one, 'room:checked'), waitFor(two, 'room:checked')]
+    assert.equal((await ack(hostSocket, 'room:check')).ok, true)
+    assert.ok((await Promise.all(arrivals)).every((event) => event.gameId === 'first'))
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    assert.equal(events.length, 0)
+    assert.equal((await ack(one, 'room:check')).ok, false)
+    console.log('PASS: Host and students connect; room broadcasts stay inside the game; students cannot send host events or spoof identities')
+    const nextState = (socket, predicate) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { socket.off('game:state', listener); reject(new Error('Timed out waiting for synchronized game state')) }, 5000)
+      const listener = (record) => {
+        if (!predicate(record)) return
+        clearTimeout(timer)
+        socket.off('game:state', listener)
+        resolve(record)
+      }
+      socket.on('game:state', listener)
+    })
+    const foreignStates = []
+    other.on('game:state', (record) => foreignStates.push(record))
+    const opening = [one, two].map((socket) => nextState(socket, (record) => record.live?.activeClue?.id === 'one' && !record.live.answerRevealed))
+    const hostQuestion = waitFor(displaySocket, 'host:state', (record) => record.live?.activeClue?.id === 'one')
+    const initialBuzzer = waitFor(one, 'buzzer:state', (state) => state.clueId === 'one' && state.status === 'closed')
+    assert.equal((await request('/games/first/live', 'PUT', { phase: 'playing', activeClueId: 'one' }, host)).status, 200)
+    for (const record of await Promise.all(opening)) {
+      assert.equal(record.live.activeClue.question, 'Question')
+      assert.equal('answer' in record.live.activeClue, false)
+      assert.equal('answer' in record.game.finalJeopardy, false)
+    }
+    const closedBuzzer = await initialBuzzer
+    const privateQuestion = await hostQuestion
+    assert.equal(privateQuestion.live.activeClue.answer, 'Hidden answer')
+    assert.equal(privateQuestion.live.answerRevealed, false)
+    const privateHttp = await (await request('/games/first/host-display', 'GET', undefined, host)).json()
+    assert.equal(privateHttp.live.activeClue.answer, 'Hidden answer')
+    const restoredPrivate = waitFor(displaySocket, 'host:state', (record) => record.live?.activeClue?.id === 'one')
+    const restoredHostSession = waitFor(displaySocket, 'session:ready')
+    displaySocket.io.engine.close()
+    await restoredHostSession
+    assert.equal((await restoredPrivate).live.activeClue.answer, 'Hidden answer')
+    console.log('PASS: Private host display receives unrevealed answers, authorizes HTTP access, and restores the current question after reconnect')
+    const buzz = (socket, state) => socket.timeout(5000).emitWithAck('buzzer:press', { clueId: state.clueId, roundId: state.roundId, studentId: 'forged' })
+    const control = (socket, state, action) => socket.timeout(5000).emitWithAck('buzzer:control', { clueId: state.clueId, roundId: state.roundId, action })
+    assert.equal((await buzz(one, closedBuzzer)).ok, false)
+    assert.equal((await control(one, closedBuzzer, 'open')).ok, false)
+    assert.equal((await buzz(hostSocket, closedBuzzer)).ok, false)
+    const opened = await control(hostSocket, closedBuzzer, 'open')
+    assert.equal(opened.ok, true)
+    assert.equal((await buzz(one, opened.state)).ok, false)
+    for (const browser of [first, second]) await request(`/games/first/students/${browser.body.student.id}`, 'PUT', { teamId: 'red' }, host)
+    const foreignBuzzes = []
+    other.on('buzzer:state', (state) => foreignBuzzes.push(state))
+    const announced = waitFor(two, 'buzzer:state', (state) => state.status === 'locked' && state.roundId === opened.state.roundId)
+    const competing = await Promise.all([buzz(one, opened.state), buzz(two, opened.state)])
+    assert.equal(competing.filter((result) => result.ok).length, 1)
+    const winner = competing.find((result) => result.ok).state.winner
+    assert.ok([first.body.student.id, second.body.student.id].includes(winner.studentId))
+    assert.equal(winner.teamId, 'red')
+    assert.equal((await announced).winner.studentId, winner.studentId)
+    assert.equal((await buzz(one, opened.state)).ok, false)
+    assert.equal(foreignBuzzes.length, 0)
+    const resetBuzz = await control(hostSocket, opened.state, 'reset')
+    assert.equal(resetBuzz.ok, true)
+    assert.notEqual(resetBuzz.state.roundId, opened.state.roundId)
+    assert.equal((await buzz(two, opened.state)).ok, false)
+    assert.equal((await buzz(two, resetBuzz.state)).ok, true)
+    const again = await control(hostSocket, resetBuzz.state, 'reset')
+    const rejoinedBuzzer = waitFor(two, 'buzzer:state', (state) => state.roundId === again.state.roundId)
+    const rejoined = waitFor(two, 'session:ready')
+    two.io.engine.close()
+    await rejoined
+    assert.equal((await rejoinedBuzzer).roundId, again.state.roundId)
+    const closed = await control(hostSocket, again.state, 'close')
+    assert.equal((await buzz(one, closed.state)).ok, false)
+    console.log('PASS: Buzzer requires host opening and team membership; simultaneous presses produce one winner; duplicates, spoofed roles, and stale rounds are rejected')
+    console.log('PASS: Host reset/close, buzzer room isolation, and reconnect recovery work')
+    const finalOpenBuzzer = await control(hostSocket, closed.state, 'open')
+    const revealedBuzzer = waitFor(one, 'buzzer:state', (state) => state.clueId === null && state.status === 'closed')
+    const reveal = nextState(one, (record) => record.live?.answerRevealed)
+    await request('/games/first/live', 'PUT', { phase: 'playing', activeClueId: 'one', answerRevealed: true }, host)
+    assert.equal((await reveal).live.activeClue.answer, 'Hidden answer')
+    assert.equal((await revealedBuzzer).clueId, null)
+    assert.equal((await buzz(one, finalOpenBuzzer.state)).ok, false)
+    console.log('PASS: Answer reveal disables buzzing and rejects delayed presses from the old round')
+    const scoring = [one, two].map((socket) => nextState(socket, (record) => record.progress.scores.red === 300 && record.progress.usedClues.includes('one')))
+    await request('/games/first/progress', 'PUT', { scores: { red: 300 }, usedClues: ['one'] }, host)
+    for (const record of await Promise.all(scoring)) assert.equal(record.live.activeClue, null)
+    assert.equal((await request('/games/first/live', 'PUT', { phase: 'playing', activeClueId: 'one' }, host)).status, 400)
+    assert.equal((await request('/games/first/live', 'PUT', { phase: 'playing', activeClueId: 'missing' }, host)).status, 400)
+    assert.equal((await request('/games/first/live', 'PUT', { phase: 'playing' }, first.cookie)).status, 401)
+    assert.equal((await request('/games/first', 'GET', undefined, first.cookie)).status, 401)
+    assert.equal((await request('/games', 'GET', undefined, first.cookie)).status, 401)
+    const final = nextState(one, (record) => record.live?.finalOpen && record.progress.finalRevealed)
+    const hostFinal = waitFor(displaySocket, 'host:state', (record) => record.live?.finalOpen && !record.progress.finalRevealed)
+    const studentFinal = nextState(one, (record) => record.live?.finalOpen && !record.progress.finalRevealed)
+    await request('/games/first/live', 'PUT', { phase: 'playing', finalOpen: true }, host)
+    assert.equal((await hostFinal).game.finalJeopardy.answer, 'Hidden final answer')
+    assert.equal('answer' in (await studentFinal).game.finalJeopardy, false)
+    await request('/games/first/progress', 'PUT', { scores: { red: 300 }, usedClues: ['one'], finalRevealed: true }, host)
+    await request('/games/first/live', 'PUT', { phase: 'playing', finalOpen: true }, host)
+    assert.equal((await final).game.finalJeopardy.answer, 'Hidden final answer')
+    assert.equal(leakedHostStates.length, 0)
+    console.log('PASS: Final Jeopardy answers stay private before reveal; students and other game rooms never receive host-only events')
+    const reset = nextState(one, (record) => record.progress.scores.red === 0 && record.progress.usedClues.length === 0)
+    const secondReplay = nextState(two, (record) => record.progress.scores.red === 0 && record.progress.usedClues.length === 0)
+    const hostReplay = waitFor(displaySocket, 'host:state', (record) => !record.progress.finalRevealed && record.progress.scores.red === 0)
+    const beforeReplay = await (await request('/games/first', 'GET', undefined, host)).json()
+    assert.equal((await request('/games/first/replay', 'POST', undefined, first.cookie)).status, 401)
+    assert.equal((await request('/games/missing/replay', 'POST', undefined, host)).status, 404)
+    const replayResponse = await request('/games/first/replay', 'POST', undefined, host)
+    assert.equal(replayResponse.status, 200)
+    const replayed = await replayResponse.json()
+    assert.deepEqual(replayed.game, beforeReplay.game)
+    assert.equal(replayed.code, beforeReplay.code)
+    assert.equal(replayed.id, beforeReplay.id)
+    assert.equal(replayed.replayCount, (beforeReplay.replayCount || 0) + 1)
+    assert.deepEqual(replayed.progress.finalWagers, {})
+    assert.deepEqual(replayed.progress.finalOutcomes, {})
+    assert.equal(replayed.progress.finalRevealed, false)
+    assert.equal(replayed.progress.finalResolved, false)
+    assert.equal(replayed.live.finalOpen, false)
+    assert.equal((await read(first.cookie)).student.teamId, 'red')
+    const resetState = await reset
+    await secondReplay
+    assert.equal((await hostReplay).live.activeClue, null)
+    assert.equal(resetState.live.activeClue, null)
+    assert.equal('answer' in resetState.game.finalJeopardy, false)
+    assert.equal((await request('/games/first/live', 'PUT', { phase: 'playing', activeClueId: 'one' }, host)).status, 200)
+    assert.equal((await buzz(one, finalOpenBuzzer.state)).ok, false)
+    await request('/games/first/live', 'PUT', { phase: 'playing', activeClueId: null }, host)
+    console.log('PASS: Replay clears progress for students and host display, preserves board/code/teams/memberships, makes clues playable, and rejects stale buzzes and unauthorized requests')
+    const teamRename = nextState(one, (record) => record.game.teams[0]?.name === 'Socket Rockets')
+    await request('/games/first', 'PUT', { game: { ...fixtures.games.first.game, teams: [{ id: 'red', name: 'Socket Rockets' }] } }, host)
+    await teamRename
+    // Restore the shared fixture for the team regression suite.
+    await request('/games/first', 'PUT', { game: fixtures.games.first.game }, host)
+    await request('/games/first/progress', 'PUT', { scores: { red: 100 }, usedClues: [] }, host)
+    assert.ok(foreignStates.every((record) => record.id === 'second'))
+    console.log('PASS: Question selection, answer reveal, scores, used clues, final round, reset, and team edits push to both students with game isolation')
+    console.log('PASS: Unrevealed answers are withheld; students cannot control live state or read host answer endpoints')
+    const membership = waitFor(one, 'student:updated')
+    const updatedRoster = waitFor(hostSocket, 'roster:updated')
+    await request(`/games/first/students/${first.body.student.id}`, 'PUT', { teamId: 'red' }, host)
+    assert.equal((await membership).teamId, 'red')
+    assert.ok((await updatedRoster).some((member) => member.id === first.body.student.id && member.teamId === 'red'))
+    assert.equal((await ack(one, 'session:check')).teamId, 'red')
+    const previousId = one.id
+    const reconnected = waitFor(one, 'session:ready')
+    const recoveredState = nextState(one, (record) => record.progress.scores.red === 100)
+    one.io.engine.close()
+    const restored = await reconnected
+    assert.notEqual(one.id, previousId)
+    assert.equal(restored.studentId, first.body.student.id)
+    assert.equal(restored.teamId, 'red')
+    assert.equal((await recoveredState).id, 'first')
+    console.log('PASS: Team membership and roster changes push immediately; reconnect sends the authoritative game snapshot')
+    const roomRestored = waitFor(one, 'room:checked')
+    await ack(hostSocket, 'room:check')
+    await roomRestored
+    const roster = await (await request('/games/first/students', 'GET', undefined, host)).json()
+    assert.equal(roster.filter((student) => student.id === first.body.student.id).length, 1)
+    console.log('PASS: Transport loss reconnects automatically with the same student, team, and room, without duplicate membership')
+    one.io.reconnection(false)
+    one.disconnect()
+    await request('/games/first/progress', 'PUT', { scores: { red: 450 }, usedClues: [] }, host)
+    const missedSnapshot = nextState(one, (record) => record.progress.scores.red === 450)
+    await connect(one)
+    assert.equal((await missedSnapshot).progress.scores.red, 450)
+    one.io.reconnection(true)
+    const [configSave, progressSave] = await Promise.all([
+      request('/games/first', 'PUT', { game: { ...fixtures.games.first.game, title: 'Concurrent save test' } }, host),
+      request('/games/first/progress', 'PUT', { scores: { red: 700 }, usedClues: [] }, host),
+    ])
+    assert.equal(configSave.status, 200)
+    assert.equal(progressSave.status, 200)
+    const concurrent = await (await request('/games/first', 'GET', undefined, host)).json()
+    assert.equal(concurrent.game.title, 'Concurrent save test')
+    assert.equal(concurrent.progress.scores.red, 700)
+    await request('/games/first', 'PUT', { game: fixtures.games.first.game }, host)
+    await request('/games/first/progress', 'PUT', { scores: { red: 100 }, usedClues: [] }, host)
+    console.log('PASS: Reconnect recovers updates missed offline; concurrent config and progress saves preserve both changes')
+    const polling = makeSocket(first.cookie, 'first', 'student', { transports: ['polling'], upgrade: false })
+    assert.equal((await connect(polling)).studentId, first.body.student.id)
+    assert.equal(polling.io.engine.transport.name, 'polling')
+    console.log('PASS: HTTP polling fallback authenticates using the same session')
+    const ended = waitFor(one, 'disconnect')
+    await request('/student/session', 'DELETE', undefined, first.cookie)
+    assert.equal(await ended, 'io server disconnect')
+    assert.equal((await read(first.cookie)).student, null)
+    const removed = waitFor(two, 'disconnect')
+    await request(`/games/first/students/${second.body.student.id}`, 'DELETE', undefined, host)
+    assert.equal(await removed, 'io server disconnect')
+    console.log('PASS: Leaving and host removal immediately disconnect affected student sockets')
+    const rateReplies = await Promise.all(Array.from({ length: 105 }, () => hostSocket.timeout(5000).emitWithAck('session:check')))
+    assert.ok(rateReplies.some((result) => result.ok === false && result.error.includes('Too many')))
+    const extraConnections = []
+    for (let index = 0; index < 16; index++) {
+      const extra = makeSocket(host, 'first', 'host', { reconnection: false })
+      extraConnections.push(extra)
+    }
+    const connectionResults = await Promise.all(extraConnections.map((extra) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Connection-limit test timed out')), 5000)
+      extra.once('session:ready', () => { clearTimeout(timer); resolve(true) })
+      extra.once('connect_error', () => { clearTimeout(timer); resolve(false) })
+      extra.connect()
+    })))
+    assert.ok(connectionResults.includes(false))
+    extraConnections.forEach((extra) => extra.disconnect())
+    console.log('PASS: Another host cannot connect to private game rooms; socket message floods are limited')
+    console.log('PASS: Excessive simultaneous connections for one session are rejected')
+  } finally {
+    sockets.forEach((socket) => socket.disconnect())
+    for (const browser of [first, second, elsewhere]) await request('/student/session', 'DELETE', undefined, browser.cookie)
+  }
+}
+
+async function main() {
+  const testData = await fs.mkdtemp(path.join(os.tmpdir(), 'jeopardy-tests-'))
+  await fs.writeFile(path.join(testData, 'games.json'), JSON.stringify(fixtures))
+  const port = 13000 + Math.floor(Math.random() * 10000)
+  const base = `http://127.0.0.1:${port}/api`
+  const signedCookie = (id) => 'jeopardy.sid=' + encodeURIComponent('s:' + id + '.' + createHmac('sha256', secret).update(id).digest('base64').replace(/=+$/, ''))
+  const host = signedCookie('test-host')
+  let child
+  let startupError = ''
+  const start = async (useLocalSecret = false) => {
+    child = spawn(process.execPath, ['-e', bootstrap], { cwd: root, env: { ...process.env, PORT: String(port), SESSION_SECRET: useLocalSecret ? '' : secret, NODE_ENV: 'test', JEOPARDY_DATA_DIR: testData }, stdio: ['ignore', 'ignore', 'pipe'] })
+    child.stderr.on('data', () => { startupError = 'The test API reported an error.' })
+    for (let attempt = 0; attempt < 80; attempt++) {
+      try { if ((await fetch(base + '/health')).ok) return } catch { /* Wait for local startup. */ }
+      if (child.exitCode !== null) throw new Error(startupError || 'Test API exited during startup')
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    throw new Error('Test API did not start')
+  }
+  const stop = async () => {
+    if (child && child.exitCode === null) await new Promise((resolve) => { child.once('exit', resolve); child.kill() })
+  }
+  const request = (route, method = 'GET', body, cookie = '') => fetch(base + route, { method, headers: { 'Content-Type': 'application/json', Cookie: cookie }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
+  const read = async (cookie) => (await request('/student/session', 'GET', undefined, cookie)).json()
+  const join = async (name, code = 'TEST01', cookie = '') => {
+    const response = await request('/student/session', 'POST', { name, code }, cookie)
+    assert.equal(response.status, 200)
+    return { cookie: response.headers.get('set-cookie').split(';')[0], body: await response.json(), headers: response.headers }
+  }
+  const pass = (label) => console.log('PASS: ' + label)
+  const gaps = []
+  try {
+    await start()
+    const otherHost = signedCookie('other-host')
+    for (const [route, method, body] of [
+      ['/games/first', 'GET'], ['/games/first/host-display', 'GET'], ['/games/first/students', 'GET'],
+      ['/games/first', 'PUT', { game: fixtures.games.first.game }],
+      ['/games/first/progress', 'PUT', { scores: { red: 999 }, usedClues: [] }],
+      ['/games/first/live', 'PUT', { phase: 'playing' }],
+      ['/games/first/reset', 'POST'], ['/games/first/replay', 'POST'],
+      ['/games/first/students/balance', 'POST'],
+      ['/games/first/import/google-sheets', 'POST', {}], ['/games/first', 'DELETE'],
+    ]) assert.equal((await request(route, method, body, otherHost)).status, 403)
+    assert.equal((await (await request('/games', 'GET', undefined, otherHost)).json()).some((game) => game.id === 'first'), false)
+    assert.equal((await request('/games', 'POST')).status, 401)
+    assert.equal((await request('/public/games', 'POST')).status, 401)
+    assert.equal((await request('/games/legacy', 'GET', undefined, host)).status, 200)
+    assert.equal((await request('/games/legacy', 'GET', undefined, otherHost)).status, 403)
+    const owned = await (await request('/games', 'POST', undefined, otherHost)).json()
+    assert.equal(owned.ownerId, 'other-host')
+    assert.equal((await request(`/games/${owned.id}`, 'GET', undefined, host)).status, 403)
+    assert.equal((await request('/games/__proto__', 'GET', undefined, host)).status, 400)
+    pass('Game ownership isolates host reads, answers, edits, replay, deletion, roster and sockets; creation requires login; legacy games bind to the original host')
+    const crossSite = await fetch(base + '/games/first/replay', { method: 'POST', headers: { Cookie: host, Origin: 'https://attacker.example' } })
+    assert.equal(crossSite.status, 403)
+    assert.equal((await fetch(base + '/games/first/replay', { method: 'POST', headers: { Cookie: host, 'Sec-Fetch-Site': 'cross-site' } })).status, 403)
+    assert.equal((await fetch(base + '/games/first', { method: 'PUT', headers: { Cookie: host, 'Content-Type': 'text/plain' }, body: '{}' })).status, 415)
+    assert.equal((await fetch(base + '/games/first', { method: 'PUT', headers: { Cookie: host, 'Content-Type': 'application/json' }, body: '{invalid' })).status, 400)
+    assert.equal((await request('/games/first', 'PUT', { game: { ...fixtures.games.first.game, categories: [null] } }, host)).status, 400)
+    assert.equal((await request('/games/first/progress', 'PUT', { scores: { red: '999' }, usedClues: [] }, host)).status, 400)
+    assert.equal((await request('/games/first/progress', 'PUT', { scores: {}, usedClues: [], finalWagers: [] }, host)).status, 400)
+    const oversized = await fetch(base + '/games/first', { method: 'PUT', headers: { Cookie: host, 'Content-Type': 'application/json' }, body: JSON.stringify({ data: 'x'.repeat(1100000) }) })
+    assert.equal(oversized.status, 413)
+    const headers = (await request('/health')).headers
+    assert.equal(headers.get('x-content-type-options'), 'nosniff')
+    assert.equal(headers.get('x-frame-options'), 'DENY')
+    assert.equal(headers.get('cache-control'), 'no-store')
+    assert.equal(headers.has('x-powered-by'), false)
+    assert.ok(headers.get('content-security-policy').includes("frame-ancestors 'none'"))
+    pass('Cross-site writes, malformed JSON, unsafe payloads and oversized bodies are rejected; security and no-cache headers are present')
+    const { buildJoinUrl, joinCodeFromLocation, canResumeSharedGame } = await import(pathToFileURL(path.join(root, 'Jeopardy/src/services/sharing.js')).href)
+    const shareUrl = new URL(buildJoinUrl('https://classroom.example/play/?hostDisplay=private&token=secret#old', ' test01 '))
+    assert.equal(shareUrl.origin, 'https://classroom.example')
+    assert.equal(shareUrl.pathname, '/play/')
+    assert.equal(shareUrl.searchParams.get('join'), '1')
+    assert.equal(shareUrl.searchParams.get('code'), 'TEST01')
+    assert.equal(shareUrl.searchParams.has('hostDisplay'), false)
+    assert.equal(shareUrl.searchParams.has('token'), false)
+    assert.equal(shareUrl.hash, '')
+    assert.equal(joinCodeFromLocation(shareUrl), 'TEST01')
+    assert.equal(joinCodeFromLocation({ search: '', hash: '#/?join=1&code=test02' }), 'TEST02')
+    assert.equal(canResumeSharedGame(shareUrl, { code: 'TEST01' }), true)
+    assert.equal(canResumeSharedGame(shareUrl, { code: 'TEST02' }), false)
+    for (const bad of ['javascript:alert(1)', 'https://user:password@example.com', 'not-a-url']) assert.throws(() => buildJoinUrl(bad, 'TEST01'))
+    assert.throws(() => buildJoinUrl('https://classroom.example', ''))
+    assert.throws(() => buildJoinUrl('https://classroom.example', '"/><script>'))
+    pass('Student share URLs preserve the app path, strip private parameters, normalize codes, reject unsafe URLs, and select the correct saved session')
+    const sharedBoard = await (await request(`/public/games/${joinCodeFromLocation(shareUrl)}`)).json()
+    assert.equal(sharedBoard.id, 'first')
+    assert.equal(sharedBoard.game.categories[0].clues[0].answer, undefined)
+    assert.equal(sharedBoard.game.finalJeopardy.answer, undefined)
+    const sharedJoin = await join('Shared-link student', joinCodeFromLocation(shareUrl))
+    assert.equal(sharedJoin.body.student.gameId, 'first')
+    const secondShare = new URL(buildJoinUrl('https://classroom.example', 'TEST02'))
+    assert.equal(canResumeSharedGame(secondShare, sharedJoin.body.record), false)
+    const switchedShare = await join('Shared-link student', joinCodeFromLocation(secondShare), sharedJoin.cookie)
+    assert.equal(switchedShare.body.student.gameId, 'second')
+    assert.equal((await request('/games/second/host-display', 'GET', undefined, switchedShare.cookie)).status, 401)
+    assert.equal((await request('/public/games/UNKNOWN')).status, 404)
+    await request('/student/session', 'DELETE', undefined, switchedShare.cookie)
+    pass('Shared links join the intended game, switch existing membership, keep answers private, and never grant host privileges')
+    assert.equal((await read()).student, null)
+    for (const body of [{ name: '', code: 'TEST01' }, { name: ' '.repeat(3), code: 'TEST01' }, { name: 'x'.repeat(51), code: 'TEST01' }, { name: {}, code: 'TEST01' }, { name: 'Alex', code: '' }]) {
+      assert.equal((await request('/student/session', 'POST', body)).status, 400)
+    }
+    assert.equal((await request('/student/session', 'POST', { name: 'Alex', code: 'WRONG' })).status, 404)
+    pass('Empty, malformed, oversized names and invalid game codes are rejected')
+    const alex = await join('  Alex  ', ' test01 ')
+    assert.equal(alex.body.student.name, 'Alex')
+    assert.equal(alex.body.student.gameId, 'first')
+    assert.match(alex.headers.get('set-cookie'), /HttpOnly/)
+    assert.match(alex.headers.get('set-cookie'), /SameSite=Lax/i)
+    assert.match(alex.headers.get('set-cookie'), /Expires=/)
+    assert.equal((await read(alex.cookie)).student.id, alex.body.student.id)
+    pass('Named join, normalized code, cookie protections, and refresh/reopen recovery')
+    const other = await join('Alex')
+    assert.notEqual(other.body.student.id, alex.body.student.id)
+    assert.equal((await read(other.cookie)).student.id, other.body.student.id)
+    assert.equal((await read(alex.cookie + 'tampered')).student, null)
+    assert.equal((await read(signedCookie('expired'))).student, null)
+    pass('Independent students, duplicate display names, tampered and expired sessions')
+    const again = await join('Alex renamed', 'TEST01', alex.cookie)
+    assert.equal(again.body.student.id, alex.body.student.id)
+    const roster = async (game = 'first') => (await request(`/games/${game}/students`, 'GET', undefined, host)).json()
+    assert.equal((await roster()).length, 2)
+    pass('Rejoining the same game preserves identity without duplicate roster entries')
+    assert.equal((await request('/games/first/students', 'GET', undefined, other.cookie)).status, 401)
+    await request(`/games/first/students/${other.body.student.id}`, 'PUT', { teamId: 'red' }, host)
+    assert.equal((await read(other.cookie)).student.teamId, 'red')
+    pass('Student sessions cannot manage the roster; host assignments reach students')
+    const switched = await join('Alex renamed', 'TEST02', again.cookie)
+    assert.equal((await roster()).length, 1)
+    assert.equal((await read(switched.cookie)).student.gameId, 'second')
+    pass('Switching games removes previous membership')
+    await request('/student/session', 'DELETE', undefined, switched.cookie)
+    assert.equal((await read(switched.cookie)).student, null)
+    assert.equal((await roster('second')).length, 0)
+    pass('Leaving clears membership and prevents automatic rejoin')
+    await request(`/games/first/students/${other.body.student.id}`, 'DELETE', undefined, host)
+    assert.equal((await read(other.cookie)).student, null)
+    pass('Host removal invalidates student membership')
+    await checkSockets({ base, host, otherHost, join, request, read })
+    const deletion = await join('Deleted-game student', 'TEST02')
+    await request('/games/second', 'DELETE', undefined, host)
+    assert.equal((await request('/public/games/TEST02')).status, 404)
+    assert.equal((await read(deletion.cookie)).student, null)
+    pass('Deleted games no longer resume')
+    assert.ok(alex.body.record.game.categories.every((category) => category.clues.every((clue) => !('answer' in clue))))
+    pass('Normal clue answers are omitted from student session responses')
+    if (alex.body.record.game.finalJeopardy?.answer) gaps.push('Final Jeopardy answers are exposed in student session responses')
+    const publicGame = await (await request('/public/games/TEST01')).json()
+    if (publicGame.game?.categories[0]?.clues[0]?.answer) gaps.push('The public game-code endpoint exposes clue answers without authentication')
+    const saveTeams = async (teams, cookie = host) => request('/games/first', 'PUT', { game: { ...fixtures.games.first.game, teams } }, cookie)
+    const students = []
+    for (let i = 0; i < 5; i++) students.push(await join(`Team student ${i + 1}`))
+    const teams = [{ id: 'red', name: 'Red' }, { id: 'blue', name: 'Blue' }, { id: 'green', name: 'Green' }]
+    const saved = await saveTeams(teams)
+    assert.equal(saved.status, 200)
+    assert.deepEqual((await saved.json()).progress.scores, { red: 100, blue: 0, green: 0 })
+    assert.equal((await (await request('/games/first', 'GET', undefined, host)).json()).game.teams.length, 3)
+    pass('Team creation persists and initializes scores without losing existing scores')
+    for (const invalid of [
+      [{ id: 'red', name: '' }], [{ id: 'red', name: '  ' }], [{ id: 'red', name: 'x'.repeat(51) }],
+      [{ id: 'red', name: 'Red' }, { id: 'blue', name: ' red ' }],
+      [{ id: 'red', name: 'Red' }, { id: 'red', name: 'Blue' }], [{ id: '__proto__', name: 'Red' }], [null],
+    ]) assert.equal((await saveTeams(invalid)).status, 400)
+    pass('Blank, oversized, duplicate names and invalid team IDs are rejected')
+    for (const [route, method, body] of [
+      ['/games/first', 'PUT', { game: fixtures.games.first.game }],
+      ['/games/first/progress', 'PUT', { scores: {}, usedClues: [] }],
+      ['/games/first/reset', 'POST', undefined],
+      ['/games/first', 'DELETE', undefined],
+      ['/games/first/import/google-sheets', 'POST', { sheetUrl: 'unused' }],
+      ['/games/first/students/balance', 'POST', undefined],
+      [`/games/first/students/${students[0].body.student.id}`, 'PUT', { teamId: 'red' }],
+      [`/games/first/students/${students[0].body.student.id}`, 'DELETE', undefined],
+    ]) assert.equal((await request(route, method, body, students[0].cookie)).status, 401)
+    pass('Student sessions cannot edit teams, scores, assignments, balancing, or removals')
+    const studentRoute = `/games/first/students/${students[0].body.student.id}`
+    await request(studentRoute, 'PUT', { teamId: 'red' }, host)
+    const renamed = await saveTeams(teams.map((team) => team.id === 'red' ? { ...team, name: '  Rockets  ' } : team))
+    const renamedRecord = await renamed.json()
+    assert.equal(renamedRecord.game.teams[0].name, 'Rockets')
+    assert.equal(renamedRecord.progress.scores.red, 100)
+    assert.equal((await read(students[0].cookie)).student.teamId, 'red')
+    pass('Renaming preserves team identity, score, and student membership')
+    assert.equal((await request(studentRoute, 'PUT', { teamId: 'missing' }, host)).status, 400)
+    assert.equal((await request(`/games/missing/students/${students[0].body.student.id}`, 'PUT', { teamId: 'red' }, host)).status, 404)
+    await request(studentRoute, 'PUT', { teamId: 'blue' }, host)
+    assert.equal((await read(students[0].cookie)).student.teamId, 'blue')
+    await request(studentRoute, 'PUT', { teamId: null }, host)
+    assert.equal((await read(students[0].cookie)).student.teamId, null)
+    pass('Moving and unassigning students works; invalid or cross-game assignments are rejected')
+    const balanced = await request('/games/first/students/balance', 'POST', undefined, host)
+    assert.equal(balanced.status, 200)
+    const balancedRoster = await balanced.json()
+    const sizes = teams.map((team) => balancedRoster.filter((student) => student.teamId === team.id).length)
+    assert.equal(balancedRoster.length, 5)
+    assert.ok(Math.max(...sizes) - Math.min(...sizes) <= 1)
+    pass('Five students distribute evenly across three teams without duplicates')
+    await request('/games/first/progress', 'PUT', { scores: { red: 200, blue: 50, green: 25 }, usedClues: [], finalWagers: { red: 100 }, finalOutcomes: { red: true } }, host)
+    const removed = await saveTeams(teams.filter((team) => team.id !== 'red'))
+    const removedRecord = await removed.json()
+    assert.equal(Object.hasOwn(removedRecord.progress.scores, 'red'), false)
+    assert.equal(Object.hasOwn(removedRecord.progress.finalWagers, 'red'), false)
+    assert.equal(Object.hasOwn(removedRecord.progress.finalOutcomes, 'red'), false)
+    for (const student of balancedRoster.filter((member) => member.teamId === 'red')) {
+      const browser = students.find((item) => item.body.student.id === student.id)
+      assert.equal((await read(browser.cookie)).student.teamId, null)
+    }
+    await saveTeams(teams)
+    assert.equal((await read(students[0].cookie)).student.teamId, null)
+    const stale = await request('/games/first/progress', 'PUT', { scores: { red: 0, blue: 50, green: 25, removed: 999 }, usedClues: [] }, host)
+    assert.equal(Object.hasOwn((await stale.json()).scores, 'removed'), false)
+    pass('Team deletion clears assignments, scores, and final-round data; stale updates cannot restore removed teams')
+    await saveTeams([])
+    assert.equal((await request('/games/first/students/balance', 'POST', undefined, host)).status, 400)
+    assert.ok((await roster()).every((student) => student.teamId === null))
+    pass('Removing all teams leaves students unassigned and rejects balancing')
+    const hostStudent = await join('Host browser student', 'TEST01', host)
+    await request('/student/session', 'DELETE', undefined, hostStudent.cookie)
+    assert.equal((await request('/games/first/students', 'GET', undefined, hostStudent.cookie)).status, 200)
+    pass('Leaving a student session preserves host permissions in the same browser')
+    const beforeRestart = await join('Restart student')
+    await saveTeams([{ id: 'red', name: 'Restart team' }])
+    await request(`/games/first/students/${beforeRestart.body.student.id}`, 'PUT', { teamId: 'red' }, host)
+    await request('/games/first/progress', 'PUT', { scores: { red: 875 }, usedClues: [], finalWagers: { red: 250 }, finalOutcomes: { red: true }, finalRevealed: true, finalResolved: false }, host)
+    await request('/games/first/live', 'PUT', { phase: 'playing', activeClueId: 'one' }, host)
+    const { io } = require('../Jeopardy/node_modules/socket.io-client')
+    const connectWithState = (cookie, role = 'student') => new Promise((resolve, reject) => {
+      const socket = io(base.replace(/\/api$/, ''), { forceNew: true, transports: ['websocket'], reconnection: false, extraHeaders: { Cookie: cookie }, auth: { gameId: 'first', role } })
+      const timer = setTimeout(() => { socket.disconnect(); reject(new Error('Persistence socket timed out')) }, 5000)
+      socket.once('connect_error', (error) => { clearTimeout(timer); socket.disconnect(); reject(error) })
+      socket.once('buzzer:state', (state) => { clearTimeout(timer); resolve({ socket, state }) })
+    })
+    const beforeHost = await connectWithState(host, 'host')
+    const beforeStudent = await connectWithState(beforeRestart.cookie)
+    const opened = await beforeHost.socket.timeout(5000).emitWithAck('buzzer:control', { ...beforeHost.state, action: 'open' })
+    assert.equal(opened.ok, true)
+    const winner = await beforeStudent.socket.timeout(5000).emitWithAck('buzzer:press', opened.state)
+    assert.equal(winner.ok, true)
+    beforeHost.socket.disconnect()
+    beforeStudent.socket.disconnect()
+    await stop()
+    await start()
+    const resumed = await read(beforeRestart.cookie)
+    assert.equal(resumed.student.id, beforeRestart.body.student.id)
+    assert.equal(resumed.student.teamId, 'red')
+    assert.equal(resumed.record.progress.scores.red, 875)
+    assert.deepEqual(resumed.record.progress.finalWagers, { red: 250 })
+    assert.deepEqual(resumed.record.progress.finalOutcomes, { red: true })
+    assert.equal(resumed.record.progress.finalRevealed, true)
+    assert.equal(resumed.record.live.activeClueId, 'one')
+    assert.equal(resumed.record.game.teams[0].name, 'Restart team')
+    assert.equal((await roster()).filter((student) => student.id === beforeRestart.body.student.id).length, 1)
+    const afterStudent = await connectWithState(beforeRestart.cookie)
+    assert.equal(afterStudent.state.status, 'locked')
+    assert.equal(afterStudent.state.roundId, winner.state.roundId)
+    assert.equal(afterStudent.state.winner.studentId, beforeRestart.body.student.id)
+    afterStudent.socket.disconnect()
+    pass('API restart restores student identity, team membership, scores, final-round data, active question, roster, and buzzer winner')
+    await request('/games/first/progress', 'PUT', { scores: { red: 975 }, usedClues: ['one'], finalResolved: true }, host)
+    await request('/student/session', 'DELETE', undefined, beforeRestart.cookie)
+    await stop()
+    await start()
+    assert.equal((await read(beforeRestart.cookie)).student, null)
+    const savedGame = await (await request('/games/first', 'GET', undefined, host)).json()
+    assert.deepEqual(savedGame.progress.usedClues, ['one'])
+    assert.equal(savedGame.progress.finalResolved, true)
+    assert.equal(savedGame.progress.scores.red, 975)
+    pass('Leaving remains effective after restart; used clues and final completion remain saved')
+    const replayMember = await join('Replay survivor')
+    await request(`/games/first/students/${replayMember.body.student.id}`, 'PUT', { teamId: 'red' }, host)
+    const savedBeforeReplay = await (await request('/games/first', 'GET', undefined, host)).json()
+    const replayedAgain = await (await request('/games/first/replay', 'POST', undefined, host)).json()
+    assert.equal(replayedAgain.progress.scores.red, 0)
+    await stop()
+    await start()
+    const savedReplay = await (await request('/games/first', 'GET', undefined, host)).json()
+    assert.deepEqual(savedReplay.game, savedBeforeReplay.game)
+    assert.equal(savedReplay.code, savedBeforeReplay.code)
+    assert.equal(savedReplay.progress.scores.red, 0)
+    assert.deepEqual(savedReplay.progress.usedClues, [])
+    assert.equal(savedReplay.progress.finalResolved, false)
+    assert.equal(savedReplay.live.activeClueId, null)
+    const replayMembership = await read(replayMember.cookie)
+    assert.equal(replayMembership.student.id, replayMember.body.student.id)
+    assert.equal(replayMembership.student.teamId, 'red')
+    const replaySocket = await connectWithState(replayMember.cookie)
+    assert.equal(replaySocket.state.status, 'closed')
+    assert.equal(replaySocket.state.winner, null)
+    replaySocket.socket.disconnect()
+    pass('Replay stays reset after API restart while preserving the saved board and student team memberships')
+    const { FileSessionStore, readJson } = await import(pathToFileURL(path.join(root, 'Jeopardy/server/persistence.js')).href)
+    const diskSessions = new FileSessionStore(path.join(testData, 'sessions'))
+    const setSession = (id, value) => new Promise((resolve, reject) => diskSessions.set(id, value, (error) => error ? reject(error) : resolve()))
+    await setSession('expired-on-disk', { cookie: { expires: new Date(Date.now() - 1000).toISOString() } })
+    assert.equal(await new Promise((resolve, reject) => diskSessions.get('expired-on-disk', (error, value) => error ? reject(error) : resolve(value))), null)
+    await setSession('persisted-host', { cookie: { originalMaxAge: 60000, expires: new Date(Date.now() + 60000).toISOString(), httpOnly: true, path: '/' }, user: { id: 'fixture-host', name: 'Persisted host fixture' } })
+    const diskHostCookie = signedCookie('persisted-host')
+    await stop()
+    await start()
+    assert.equal((await request('/games/first/host-display', 'GET', undefined, diskHostCookie)).status, 200)
+    assert.equal((await request('/auth/logout', 'POST', undefined, diskHostCookie)).status, 204)
+    await stop()
+    await start()
+    assert.equal((await request('/games/first/host-display', 'GET', undefined, diskHostCookie)).status, 401)
+    const removedAfterSave = await join('Removed before restart')
+    await request(`/games/first/students/${removedAfterSave.body.student.id}`, 'DELETE', undefined, host)
+    await stop()
+    await start()
+    assert.equal((await read(removedAfterSave.cookie)).student, null)
+    pass('Persisted host sessions restore; logout, host removal, and expiration remain effective')
+    await stop()
+    await start(true)
+    const localSecretStudent = await join('Local-secret student')
+    await stop()
+    await start(true)
+    assert.equal((await read(localSecretStudent.cookie)).student.id, localSecretStudent.body.student.id)
+    assert.ok((await fs.stat(path.join(testData, 'session-secret'))).isFile())
+    const corruptFile = path.join(testData, 'corrupt-test.json')
+    await fs.writeFile(corruptFile, '{broken')
+    await assert.rejects(readJson(corruptFile, {}), SyntaxError)
+    assert.equal(await fs.readFile(corruptFile, 'utf8'), '{broken')
+    pass('Saved local signing secret survives restart; corrupt JSON is reported instead of replaced with empty data')
+    let limited
+    for (let index = 0; index < 130; index++) {
+      limited = await fetch(base + '/public/games/UNKNOWN', { headers: { 'X-Forwarded-For': `198.51.100.${index}` } })
+      if (limited.status === 429) break
+    }
+    assert.equal(limited.status, 429)
+    assert.ok(Number(limited.headers.get('retry-after')) > 0)
+    let joinLimited
+    for (let index = 0; index < 130; index++) {
+      joinLimited = await request('/student/session', 'POST', { name: '', code: 'TEST01' })
+      if (joinLimited.status === 429) break
+    }
+    assert.equal(joinLimited.status, 429)
+    pass('Game-code lookups and join floods receive 429 with retry guidance; forged proxy headers cannot bypass default limits')
+    const weakProduction = spawn(process.execPath, ['-e', bootstrap], { cwd: root, env: { ...process.env, JEOPARDY_DATA_DIR: testData, NODE_ENV: 'production', SESSION_SECRET: 'too-short', PORT: String(port) }, stdio: ['ignore', 'ignore', 'pipe'] })
+    let productionError = ''
+    weakProduction.stderr.on('data', (chunk) => { productionError += chunk.toString() })
+    const productionExit = await new Promise((resolve) => weakProduction.once('exit', resolve))
+    assert.equal(productionExit, 1)
+    assert.ok(productionError.includes('Production requires a SESSION_SECRET'))
+    pass('Production startup rejects missing or weak session signing secrets')
+    for (const gap of gaps) console.log('KNOWN STUDENT-SESSION GAP: ' + gap)
+    console.log(`Finished: core session checks passed; ${gaps.length} remaining gaps.`)
+  } finally {
+    await stop()
+    if (path.dirname(testData) !== path.resolve(os.tmpdir()) || !path.basename(testData).startsWith('jeopardy-tests-')) throw new Error('Refusing cleanup outside the temporary test directory')
+    await fs.rm(testData, { recursive: true, force: true })
+  }
+}
+main().catch((error) => { console.error(error); process.exitCode = 1 })

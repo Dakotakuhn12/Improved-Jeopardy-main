@@ -1,0 +1,35 @@
+{
+  "name": "improved-jeopardy",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node Jeopardy/server/index.js",
+    "dev": "node scripts/dev.cjs",
+    "server": "node Jeopardy/server/index.js",
+    "setup": "npm install && npm --prefix Jeopardy install",
+    "build": "npm --prefix Jeopardy run build",
+    "test": "node scripts/check-student-sessions.cjs",
+    "test:teams": "node scripts/check-student-sessions.cjs",
+    "test:sockets": "node scripts/check-student-sessions.cjs",
+    "test:sync": "node scripts/check-student-sessions.cjs",
+    "test:buzzer": "node scripts/check-student-sessions.cjs",
+    "test:host-display": "node scripts/check-student-sessions.cjs",
+    "test:persistence": "node scripts/check-student-sessions.cjs",
+    "test:replay": "node scripts/check-student-sessions.cjs",
+    "test:sharing": "node scripts/check-student-sessions.cjs",
+    "test:security": "node scripts/check-student-sessions.cjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@azure/msal-node": "^6.0.1",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-session": "^1.19.0",
+    "googleapis": "^182.0.0",
+    "socket.io": "^4.8.4"
+  }
+}
