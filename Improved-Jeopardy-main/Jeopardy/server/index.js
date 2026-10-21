@@ -1,12 +1,15 @@
 import express from 'express'
 import { createServer } from 'node:http'
 import { attachRealtime, publicGameState, hostDisplayState } from './realtime.js'
-import { FileSessionStore, readJson, writeJson } from './persistence.js'
+import { FileSessionStore, readJson, writeJson, flushWrites, configureDatabase } from './persistence.js'
+import { connectMongo } from './mongo-persistence.js'
+import { checkProduction } from './production.js'
 import { hostId, safeId, securityMiddleware, validBoard } from './security.js'
 import session from 'express-session'
 import { ConfidentialClientApplication } from '@azure/msal-node'
 import dotenv from 'dotenv'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, access } from 'node:fs/promises'
+import { constants } from 'node:fs'
 import { readFileSync } from 'node:fs'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
@@ -38,6 +41,10 @@ const clientSecret = process.env.MS_ENTRA_CLIENT_SECRET || legacy.secret
 const port = Number(process.env.PORT) || 3001
 const appUrl = (process.env.APP_URL || `http://localhost:${port}`).replace(/\/$/, '')
 const redirectUri = process.env.MS_ENTRA_REDIRECT_URI || `${appUrl}/api/auth/callback`
+checkProduction({ appUrl, redirectUri, tenantId, clientId, clientSecret, built: existsSync(path.join(rootDir, 'dist', 'index.html')), dataDirectory: process.env.JEOPARDY_DATA_DIR })
+if (process.env.RENDER === 'true' && !process.env.MONGODB_URI) throw new Error('Render requires MONGODB_URI; local files are not persistent on the free plan.')
+const database = process.env.MONGODB_URI ? await connectMongo(process.env.MONGODB_URI, process.env.MONGODB_DATABASE || 'jeopardy') : null
+if (database) configureDatabase(database)
 await mkdir(dataDir, { recursive: true })
 const secretFile = path.join(dataDir, 'session-secret')
 if (!process.env.SESSION_SECRET && !existsSync(secretFile)) await writeFile(secretFile, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 })
@@ -60,7 +67,7 @@ app.use(express.json({ limit: '1mb' }))
 const sessionMiddleware = session({
   name: 'jeopardy.sid',
   secret: sessionSecret,
-  store: new FileSessionStore(path.join(dataDir, 'sessions')),
+  store: database ? database.sessions() : new FileSessionStore(path.join(dataDir, 'sessions')),
   resave: false,
   saveUninitialized: false,
   cookie: { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' },
@@ -356,6 +363,16 @@ function gameFromSheet(csv, title, range) {
 }
 
 app.get('/api/health', (_request, response) => response.json({ status: 'ok' }))
+let shuttingDown = false
+app.get('/api/ready', async (_request, response) => {
+  try {
+    if (shuttingDown) return response.status(503).json({ status: 'not-ready' })
+    await access(dataDir, constants.R_OK | constants.W_OK)
+    if (database) await database.ready()
+    await readStore()
+    response.json({ status: 'ready' })
+  } catch { response.status(503).json({ status: 'not-ready' }) }
+})
 
 // Student membership is held in the signed session, independently of host login.
 const membershipFile = path.join(dataDir, 'students.json')
@@ -563,7 +580,8 @@ app.post('/api/public/games', requireHost, async (request, response, next) => {
   } catch (error) { next(error) }
 })
 
-app.post('/api/games/:gameId/import/google-sheets', requireHost, async (request, response, next) => {
+// Every import is a new owned snapshot, including calls from older clients.
+app.post(['/api/import/google-sheets', '/api/games/:gameId/import/google-sheets'], requireHost, async (request, response, next) => {
   try {
     const { sheetUrl, cellRange } = request.body || {}
     const { sheetId, gid } = googleSheetDetails(sheetUrl)
@@ -571,16 +589,19 @@ app.post('/api/games/:gameId/import/google-sheets', requireHost, async (request,
     const sheetResponse = await fetch(exportUrl, { signal: AbortSignal.timeout(10000) })
     if (!sheetResponse.ok) throw new Error('Google could not open that sheet. Set sharing to “Anyone with the link” and try again.')
 
-    const { store, record } = await getOrCreateGame(request.params.gameId)
+    const store = await readStore()
+    const record = newGameRecord(store, hostId(request.session.user))
     const sheetTitle = await googleSheetTitle(sheetId, record.game.title)
     const sheetText = await boundedSheetText(sheetResponse)
     const imported = gameFromSheet(sheetText, sheetTitle, cellRange)
     if (!validGame(imported)) throw badSheetRequest('The spreadsheet exceeds the allowed board size or contains invalid values.')
     record.game = imported
     record.progress = initialProgress(record.game)
+    record.live = { phase: 'editor', activeClueId: null, answerRevealed: false, finalOpen: false }
     record.updatedAt = new Date().toISOString()
+    store.games[record.id] = record
     await writeStore(store)
-    response.json(record)
+    response.status(201).json(record)
   } catch (error) {
     if (error.status === 400) return response.status(400).json({ error: error.message })
     if (error instanceof TypeError) return response.status(400).json({ error: 'Unable to retrieve that Google Sheet.' })
@@ -715,8 +736,25 @@ app.use((error, _request, response, next) => {
   response.status(status).json({ error: status === 400 ? 'Invalid JSON request.' : status === 413 ? 'Request body is too large.' : 'The server could not complete that request.' })
 })
 
-httpServer.listen(port, () => {
+httpServer.listen(port, process.env.HOST || '0.0.0.0', () => {
   console.log(`Jeopardy API listening on http://localhost:${port}`)
   if (!authConfigured) console.warn('Microsoft authentication is disabled: add the MS_ENTRA_* variables described in .env.')
   if (!process.env.SESSION_SECRET) console.warn('Using the saved local session secret in the data directory. Set SESSION_SECRET for deployment.')
 })
+
+async function shutdown() {
+  if (shuttingDown) return
+  shuttingDown = true
+  const timeout = setTimeout(() => process.exit(1), 10000)
+  timeout.unref()
+  try {
+    await new Promise((resolve) => io.close(resolve))
+    await mutationQueue
+    await flushWrites()
+    if (database) await database.close()
+    clearTimeout(timeout)
+    process.exit(0)
+  } catch { process.exit(1) }
+}
+process.once('SIGTERM', shutdown)
+process.once('SIGINT', shutdown)

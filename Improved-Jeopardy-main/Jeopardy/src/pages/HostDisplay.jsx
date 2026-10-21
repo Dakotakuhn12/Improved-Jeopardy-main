@@ -7,7 +7,7 @@ export default function HostDisplay({ gameId }) {
   const [buzzer, setBuzzer] = useState(null)
   const clue = record?.live?.activeClue
   const final = record?.live?.finalOpen ? record.game.finalJeopardy : null
-  return <main className="game-shell host-answer-display">
+  return <main id="main-content" tabIndex={-1} className="game-shell host-answer-display">
     <header className="topbar"><div><p className="eyebrow">PRIVATE HOST ANSWER DISPLAY</p><h1>{record?.game.title || 'Host answer display'}</h1></div><a className="secondary-button" href="/">Open game controls</a></header>
     <p>Keep this screen on your own device. It shows answers before students see them.</p>
     <ConnectionStatus gameId={gameId} role="host" onHostState={(state) => { setRecord(state); setEnded(false) }} onBuzzerState={setBuzzer} onSessionEnded={() => { setRecord(null); setEnded(true) }} />

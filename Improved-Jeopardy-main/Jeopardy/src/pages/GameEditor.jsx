@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import ShareGame from '../components/ShareGame'
 import TeamRoster from '../components/TeamRoster'
+import useDialog from '../hooks/useDialog'
 
 const id = () => crypto.randomUUID()
 const clue = (value = 100) => ({ id: id(), value, question: '', answer: '' })
@@ -19,6 +20,8 @@ export default function GameEditor({ game, gameId, games, openGame, newGame, del
   const [importing, setImporting] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const logoutRef = useDialog(showLogoutConfirm, cancelLogout)
+  const deleteRef = useDialog(showDeleteConfirm, () => setShowDeleteConfirm(false), deleting)
   const validTeams = game.teams.every((team) => team.name.trim() && team.name.trim().length <= 50) && new Set(game.teams.map((team) => team.name.trim().toLowerCase())).size === game.teams.length
 
   const gameOptions = games.some((item) => item.id === gameId)
@@ -46,7 +49,7 @@ export default function GameEditor({ game, gameId, games, openGame, newGame, del
     if (deleted) setShowDeleteConfirm(false)
   }
 
-  return <main className="builder-shell">
+  return <main id="main-content" tabIndex={-1} className="builder-shell">
     <header className="topbar">
       <div><p className="eyebrow">GAME EDITOR</p><h1>Edit your board</h1></div>
       <div className="header-actions"><button className="new-game" disabled={!ready} onClick={start}>Start game</button><button className="logout-button" onClick={handleLogout}>Log out</button></div>
@@ -64,6 +67,7 @@ export default function GameEditor({ game, gameId, games, openGame, newGame, del
     </section>
     <section className="sheet-import" aria-labelledby="sheet-import-title">
       <div><p className="eyebrow">GOOGLE SHEETS</p><h2 id="sheet-import-title">Import a game board</h2><p>Share the sheet with “Anyone with the link.” Use either Category, Question, and Answer columns, or Category followed by repeating Question/Answer pairs. A Final row can include its question, answer, and category. Optionally enter a rectangular cell range such as A1:J7; the first row in that range must contain the headers.</p></div>
+      <p>Each import creates a new saved game in your library. Edit its questions and answers here; later spreadsheet changes will not affect it. Import again to load a new copy.</p>
       <form onSubmit={submitSheetImport}>
         <label htmlFor="google-sheet-url">Google Sheets link or ID</label>
         <div className="sheet-import-controls"><input id="google-sheet-url" type="text" value={sheetUrl} onChange={(event) => setSheetUrl(event.target.value)} placeholder="https://docs.google.com/spreadsheets/d/..." /><button className="secondary-button" type="submit" disabled={!sheetUrl.trim() || importing}>{importing ? 'Importing…' : 'Import sheet'}</button></div>
@@ -95,8 +99,8 @@ export default function GameEditor({ game, gameId, games, openGame, newGame, del
       <p className="builder-intro">This round appears after every board question has been answered. All teams wager up to their current score.</p>
     </section>
     {!ready && <p className="validation-message">Each category needs a title and at least one question with a value and answer before the game can start.</p>}
-    {showLogoutConfirm && <div className="modal-backdrop" role="presentation" onMouseDown={cancelLogout}><section className="logout-confirmation" role="dialog" aria-modal="true" aria-label="Confirm sign out" onMouseDown={(event) => event.stopPropagation()}><h2>Sign out of Microsoft?</h2><p>You’ll need to sign in again to access the game.</p><div className="logout-actions"><button className="secondary-button" onClick={cancelLogout}>Cancel</button><button className="logout-button" onClick={handleLogoutConfirm}>Yes, sign out</button></div></section></div>}
-    {showDeleteConfirm && <div className="modal-backdrop" role="presentation" onMouseDown={() => !deleting && setShowDeleteConfirm(false)}><section className="logout-confirmation" role="alertdialog" aria-modal="true" aria-labelledby="delete-game-title" onMouseDown={(event) => event.stopPropagation()}><h2 id="delete-game-title">Delete “{game.title || 'Untitled Game'}”?</h2><p>This will permanently delete this game and its saved progress.</p><div className="logout-actions"><button className="secondary-button" type="button" disabled={deleting} onClick={() => setShowDeleteConfirm(false)}>Cancel</button><button className="logout-button" type="button" disabled={deleting} onClick={confirmDeleteGame}>{deleting ? 'Deleting…' : 'Yes, delete game'}</button></div></section></div>}
+    {showLogoutConfirm && <div className="modal-backdrop" role="presentation" onMouseDown={cancelLogout}><section ref={logoutRef} tabIndex={-1} className="logout-confirmation" role="dialog" aria-modal="true" aria-label="Confirm sign out" onMouseDown={(event) => event.stopPropagation()}><h2>Sign out of Microsoft?</h2><p>You’ll need to sign in again to access the game.</p><div className="logout-actions"><button className="secondary-button" onClick={cancelLogout}>Cancel</button><button className="logout-button" onClick={handleLogoutConfirm}>Yes, sign out</button></div></section></div>}
+    {showDeleteConfirm && <div className="modal-backdrop" role="presentation" onMouseDown={() => !deleting && setShowDeleteConfirm(false)}><section ref={deleteRef} tabIndex={-1} className="logout-confirmation" role="alertdialog" aria-modal="true" aria-labelledby="delete-game-title" onMouseDown={(event) => event.stopPropagation()}><h2 id="delete-game-title">Delete “{game.title || 'Untitled Game'}”?</h2><p>This will permanently delete this game and its saved progress.</p><div className="logout-actions"><button className="secondary-button" type="button" disabled={deleting} onClick={() => setShowDeleteConfirm(false)}>Cancel</button><button className="logout-button" type="button" disabled={deleting} onClick={confirmDeleteGame}>{deleting ? 'Deleting…' : 'Yes, delete game'}</button></div></section></div>}
   </main>
 }
 

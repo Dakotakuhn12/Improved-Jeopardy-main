@@ -1,0 +1,31 @@
+const assert = require('node:assert/strict')
+
+async function main() {
+  if (!process.argv[2]) throw new Error('Usage: npm run verify:deployment -- https://your-app.example')
+  const url = new URL(process.argv[2])
+  if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Provide the public HTTPS app origin without credentials or a path.')
+  const request = (path) => fetch(new URL(path, url), { redirect: 'error', signal: AbortSignal.timeout(15000) })
+  for (const route of ['/api/health', '/api/ready']) {
+    const response = await request(route)
+    assert.equal(response.status, 200, `${route} must return 200`)
+    const result = await response.json()
+    assert.ok(['ok', 'ready'].includes(result.status))
+  }
+  const response = await request('/')
+  assert.equal(response.status, 200)
+  const html = await response.text()
+  assert.ok(html.includes('id="root"') && !html.includes('/src/main.jsx'), 'The public page must serve the compiled app')
+  assert.ok(response.headers.get('strict-transport-security'), 'HTTPS deployment should provide HSTS')
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff')
+  const script = html.match(/src="([^\"]+\.js)"/)
+  assert.ok(script, 'Compiled JavaScript asset was not found')
+  assert.equal((await request(script[1])).status, 200)
+  const transport = await request('/socket.io/?EIO=4&transport=polling')
+  assert.equal(transport.status, 200)
+  const handshake = await transport.text()
+  assert.ok(handshake.startsWith('0{'), 'Socket.IO must be routed to the API')
+  assert.ok(JSON.parse(handshake.slice(1)).upgrades.includes('websocket'), 'WebSocket upgrades must be available')
+  console.log('PASS: Public HTTPS, health/readiness, built app/assets, security headers, and Socket.IO bootstrap.')
+  console.log('Still verify real Microsoft sign-in, WebSocket upgrade through the host proxy, two-device gameplay, and redeploy persistence.')
+}
+main().catch((error) => { console.error(error.message); process.exitCode = 1 })

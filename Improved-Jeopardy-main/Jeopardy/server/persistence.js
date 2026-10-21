@@ -3,16 +3,24 @@ import { mkdir, readFile, writeFile, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 
+let database
+export function configureDatabase(storage) { database = storage }
+
 export async function readJson(file, fallback) {
+  if (database) return database.read(path.basename(file), fallback)
   try { return JSON.parse(await readFile(file, 'utf8')) }
   catch (error) { if (error.code === 'ENOENT') return fallback; throw error }
 }
 
 const writes = new Map()
+export async function flushWrites() {
+  while (writes.size) await Promise.all([...writes.values()])
+}
 export function writeJson(file, value) {
   const json = JSON.stringify(value, null, 2)
   const operation = (writes.get(file) || Promise.resolve()).catch(() => {}).then(async () => {
     await mkdir(path.dirname(file), { recursive: true })
+    if (database) { await database.write(path.basename(file), JSON.parse(json)); return }
     const temporary = `${file}.${randomUUID()}.tmp`
     try {
       await writeFile(temporary, json, { encoding: 'utf8', mode: 0o600 })

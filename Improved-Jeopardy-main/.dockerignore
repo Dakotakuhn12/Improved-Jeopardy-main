@@ -1,0 +1,14 @@
+**/node_modules
+**/dist
+**/data
+**/.env
+**/.env.*
+**/deployment.env
+deployment.env.example
+**/*.log
+.git
+.github
+scripts
+Jeopardy/tests
+**/.cache
+audit-*.json

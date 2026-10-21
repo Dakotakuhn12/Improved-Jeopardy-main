@@ -5,11 +5,37 @@
 
 body {
   margin: 0;
-  min-width: 320px;
+  min-width: 0;
   color: #f7f7ff;
   background: #080b2b;
   font-family: 'DM Sans', Arial, sans-serif;
 }
+
+/* Touch, keyboard, zoom, and short-screen support. */
+button, .secondary-button, .microsoft-login, input, select {
+  min-height: 44px;
+}
+
+button, .secondary-button, .microsoft-login {
+  touch-action: manipulation;
+}
+
+:where(button, a, input, textarea, select, [tabindex]):focus-visible {
+  outline: 3px solid #ffe082;
+  outline-offset: 3px;
+}
+
+.skip-link {
+  position: fixed;
+  left: 12px;
+  top: -100px;
+  z-index: 100;
+  padding: 12px;
+  background: #fff;
+  color: #080b2b;
+}
+.skip-link:focus { top: 12px; }
+.mobile-board-hint { display: none; }
 
 button, input, textarea {
   font: inherit;

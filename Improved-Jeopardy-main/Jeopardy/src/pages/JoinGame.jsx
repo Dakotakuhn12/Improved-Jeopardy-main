@@ -32,7 +32,7 @@ export default function JoinGame({ onJoined }) {
     }
   }
 
-  return <main className="login-shell">
+  return <main id="main-content" tabIndex={-1} className="login-shell">
     <section className="login-card" aria-labelledby="join-title">
       <p className="eyebrow">CLASSROOM JEOPARDY</p>
       <h1 id="join-title">Join a game</h1>

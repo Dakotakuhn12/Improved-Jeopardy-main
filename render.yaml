@@ -1,0 +1,36 @@
+# Blueprint for this workspace's repository layout.
+# Free web service; durable state lives in a separately configured Atlas Free cluster.
+services:
+  - type: web
+    name: classroom-jeopardy
+    runtime: docker
+    plan: free
+    numInstances: 1
+    dockerfilePath: ./Improved-Jeopardy-main/Dockerfile
+    dockerContext: ./Improved-Jeopardy-main
+    healthCheckPath: /api/ready
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: JEOPARDY_DATA_DIR
+        value: /data
+      - key: TRUST_PROXY
+        value: "1"
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DATABASE
+        value: jeopardy
+      - key: APP_URL
+        sync: false
+      - key: MS_ENTRA_TENANT_ID
+        sync: false
+      - key: MS_ENTRA_CLIENT_ID
+        sync: false
+      - key: MS_ENTRA_CLIENT_SECRET
+        sync: false
+      - key: MS_ENTRA_REDIRECT_URI
+        sync: false

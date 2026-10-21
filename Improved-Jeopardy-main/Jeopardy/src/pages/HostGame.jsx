@@ -14,7 +14,7 @@ export default function HostGame({ game, onBack }) {
     }
   }
 
-  return <main className="login-shell">
+  return <main id="main-content" tabIndex={-1} className="login-shell">
     <section className="login-card" aria-labelledby="host-title" style={{ width: 'min(560px, 100%)' }}>
       <p className="eyebrow">HOST ROOM</p>
       <h1 id="host-title">Game code</h1>

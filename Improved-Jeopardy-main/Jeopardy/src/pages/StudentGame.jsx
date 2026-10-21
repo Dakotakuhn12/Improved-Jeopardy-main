@@ -11,7 +11,7 @@ export default function StudentGame({ game: initialGame, onBack, onExpired }) {
     setLeaving(true)
     try { await onBack() } catch (requestError) { setError(requestError.message); setLeaving(false) }
   }
-  return <main className="game-shell">
+  return <main id="main-content" tabIndex={-1} className="game-shell">
     <header className="topbar">
       <div>
         <p className="eyebrow">LIVE GAME</p>
@@ -45,7 +45,8 @@ export default function StudentGame({ game: initialGame, onBack, onExpired }) {
       ))}
     </section>
 
-    {game?.game?.categories?.length ? <section className="board" aria-label="Jeopardy game board" style={{ '--columns': game.game.categories.length }}>
+    {Boolean(game?.game?.categories?.length) && <p className="mobile-board-hint">Swipe the board sideways to see more categories.</p>}
+    {game?.game?.categories?.length ? <section className="board" role="region" tabIndex={0} aria-label="Jeopardy game board. Scroll horizontally for more categories." style={{ '--columns': game.game.categories.length }}>
       {game.game.categories.map((cat) => (
         <div className="category" key={cat.id}>
           <div className="category-title">{cat.title}</div>

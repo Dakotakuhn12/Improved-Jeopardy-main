@@ -36,3 +36,4 @@ Jeopardy/data/*.tmp
 
 .env
 .env.example
+deployment.env

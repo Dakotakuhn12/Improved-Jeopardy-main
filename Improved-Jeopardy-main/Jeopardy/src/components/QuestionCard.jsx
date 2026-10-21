@@ -1,10 +1,12 @@
 import Buzzer from './Buzzer'
+import useDialog from '../hooks/useDialog'
 
 export default function QuestionCard({ gameId, selected, showAnswer, teams, onClose, onReveal, onScore, onFinish }) {
+  const dialogRef = useDialog(Boolean(selected), onClose)
   if (!selected) return null
 
   return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-    <section className="clue-modal" role="dialog" aria-modal="true" aria-label="Selected question" onMouseDown={(event) => event.stopPropagation()}>
+    <section ref={dialogRef} tabIndex={-1} className="clue-modal" role="dialog" aria-modal="true" aria-label="Selected question" onMouseDown={(event) => event.stopPropagation()}>
       <button className="close" onClick={onClose} aria-label="Close question">×</button>
       <p className="modal-category">{selected.cat.title} · ${Number(selected.item.value).toLocaleString()}</p>
       <p className="clue-text">{showAnswer ? selected.item.answer : selected.item.question}</p>

@@ -8,6 +8,7 @@ import StudentGame from './pages/StudentGame'
 import GameEditor from './pages/GameEditor'
 import GameBoard from './components/GameBoard'
 import './index.css'
+import './mobile.css'
 import { getStudentSession, leaveStudentSession, saveLiveState, replayGame } from './services/gameApi'
 
 function GameApp() {
@@ -189,7 +190,13 @@ function GameApp() {
 
   const importSheet = async (sheetUrl, cellRange) => {
     try {
-      const record = await importGoogleSheet(gameId, sheetUrl, cellRange)
+      // Preserve the current draft even if import finishes before autosave's delay.
+      await pendingSaves.current
+      const saved = await saveGame(gameId, game)
+      const record = await importGoogleSheet(sheetUrl, cellRange)
+      setGames((current) => [{ id: record.id, title: record.game.title, createdAt: record.createdAt, updatedAt: record.updatedAt }, ...current.map((item) => item.id === saved.id ? { ...item, title: saved.game.title, updatedAt: saved.updatedAt } : item)])
+      setGameId(record.id)
+      setEditing(true)
       setGame(record.game)
       applyProgress(record.progress)
       setRoomCode(record.code || '')
@@ -220,13 +227,13 @@ function GameApp() {
   const confirmLogout = () => setShowLogoutConfirm(true)
   const cancelLogout = () => setShowLogoutConfirm(false)
 
-  if (checkingStudent) return <main className="status-shell"><p>Checking student session…</p></main>
+  if (checkingStudent) return <main id="main-content" tabIndex={-1} className="status-shell"><p>Checking student session…</p></main>
   if (guestGame) return <StudentGame game={guestGame} onBack={leaveStudent} onExpired={() => { setGuestGame(null); setJoinMode(true) }} />
-  if (auth === null) return <main className="status-shell"><p>Checking sign-in…</p></main>
+  if (auth === null) return <main id="main-content" tabIndex={-1} className="status-shell"><p>Checking sign-in…</p></main>
   if (joinMode || readJoinCodeFromUrl()) return <JoinGame onJoined={(record) => { setGuestGame(record); setJoinMode(false) }} />
   if (!auth) return <Login error={authError} onJoin={() => setJoinMode(true)} />
-  if (error && !loaded) return <main className="status-shell"><h1>Could not connect to the game server</h1><p>{error}</p><p>Start the backend with <code>npm run server</code>, then refresh this page.</p></main>
-  if (!game) return <main className="status-shell"><p>Loading game…</p></main>
+  if (error && !loaded) return <main id="main-content" tabIndex={-1} className="status-shell"><h1>Could not connect to the game server</h1><p>{error}</p><p>Start the backend with <code>npm run server</code>, then refresh this page.</p></main>
+  if (!game) return <main id="main-content" tabIndex={-1} className="status-shell"><p>Loading game…</p></main>
 
   const ready = game.teams.length > 0 && game.teams.every((team) => team.name.trim() && team.name.trim().length <= 50) && new Set(game.teams.map((team) => team.name.trim().toLowerCase())).size === game.teams.length && game.categories.length > 0 && game.categories.every((cat) => cat.title.trim() && cat.clues.length && cat.clues.every((item) => item.question.trim() && item.answer.trim() && Number(item.value) > 0))
   const update = (fn) => {
@@ -319,7 +326,7 @@ function Builder({ game, gameId, games, openGame, newGame, importSheet, error, r
     }
   }
 
-  return <main className="builder-shell">
+  return <main id="main-content" tabIndex={-1} className="builder-shell">
     <header className="topbar">
       <div><p className="eyebrow">GAME EDITOR</p><h1>Edit your board</h1></div>
       <div className="header-actions"><button className="new-game" disabled={!ready} onClick={start}>Start game</button><button className="logout-button" onClick={handleLogout}>Log out</button></div>
@@ -381,5 +388,5 @@ export default App
 
 function App() {
   const hostGameId = new URLSearchParams(window.location.search).get('hostDisplay')
-  return hostGameId ? <HostDisplay key={hostGameId} gameId={hostGameId} /> : <GameApp />
+  return <><a className="skip-link" href="#main-content">Skip to content</a>{hostGameId ? <HostDisplay key={hostGameId} gameId={hostGameId} /> : <GameApp />}</>
 }

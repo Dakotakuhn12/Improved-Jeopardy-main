@@ -1,5 +1,5 @@
 export default function Login({ error, onJoin }) {
-  return <main className="login-shell">
+  return <main id="main-content" tabIndex={-1} className="login-shell">
     <section className="login-card" aria-labelledby="login-title">
       <p className="eyebrow">CLASSROOM JEOPARDY</p>
       <h1 id="login-title">Welcome</h1>

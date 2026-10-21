@@ -2,6 +2,17 @@
 
 A configurable Jeopardy-style classroom game backed by a Node/Express API.
 
+## Free hosted storage
+
+The deployment target is now **Render Free + MongoDB Atlas Free**, with no paid
+Render disk. See [DEPLOYMENT.md](../DEPLOYMENT.md) for setup. Set the private
+server variable `MONGODB_URI` and optionally `MONGODB_DATABASE` (default `jeopardy`).
+Games, answers, ownership, progress, memberships, buzzer state, and sessions are
+then persisted in MongoDB; the file-storage descriptions below apply to local
+development without that variable. Render refuses startup without the database.
+Existing local games are not automatically uploaded. Run `npm run test:database`
+from the workspace root for isolated real-database production/restart tests.
+
 ## Run locally
 
 From the project folder containing `Jeopardy` and the root `package.json`
@@ -204,6 +215,15 @@ The Game Editor can create new games and reopen saved games. It remembers the la
 
 ## Import from Google Sheets
 
+Each import creates a new saved game owned by the signed-in user and opens that
+copy in the editor. Reopen it with **Open game** to edit questions and answers;
+edits save automatically. Changes to the original spreadsheet never update a
+saved copy. Import again to create another game with the latest spreadsheet
+contents, keeping previous copies and their progress intact. Invalid imports
+do not create an empty game. With `MONGODB_URI` configured, these snapshots are
+stored in MongoDB and restored after restarts. `npm run test:database` covers
+spreadsheet changes, in-app edits, re-imports, ownership, and restart recovery.
+
 In the Game Editor, paste a Google Sheets link (or spreadsheet ID) into **Import a game board**. The sheet must be shared as **Anyone with the link**. The selected tab is imported when the URL contains its `gid`.
 
 Use this header row; `Value` is optional and defaults to $100, $200, and so on within each category:
@@ -327,7 +347,48 @@ Both dependency audits reported zero known vulnerabilities after this change.
 These checks do not replace production HTTPS/proxy validation or a full security
 review; deployment validation belongs to step 22.
 
-## Production build commands
+## Mobile and UI polish (checklist step 21)
+
+Phone layouts stack editor fields and wrap host actions. Buttons and form
+controls have at least 44px touch targets; the buzzer remains a large full-width
+button. Phone inputs use 16px text, long labels wrap, and score cards reflow.
+Wide boards scroll inside their own region, with a visible sideways-swipe hint
+and keyboard-focusable board. The page retains browser zoom support.
+
+Dialogs scroll within the viewport on short/landscape screens. Opening one
+moves focus inside and prevents background scrolling. Tab/Shift+Tab remain
+inside the dialog; Escape closes it unless a confirmation is busy. Closing
+restores focus to the previous control. Keyboard focus is visibly outlined,
+there is a skip-to-content link, and reduced-motion preferences are respected.
+Typed Final Jeopardy wagers are converted to numeric API values for saving.
+
+Run `npm run test:mobile` for DOM tests of dialog focus/trapping/restoration,
+Escape handling, busy confirmations, wager validation/serialization, clipboard
+feedback, buzzer availability, and the viewport/zoom configuration. `npm test`
+now runs both the existing API/socket tests and the UI suite. Lint/build remain
+`npm run lint` and `npm run build` from the outer project folder.
+
+DOM tests do not calculate real CSS layout. Browser automation was unavailable
+during this change. Visually check at 320/375px phone widths, tablet width, and
+desktop width, including landscape and 200% zoom: the page should not overflow,
+only the board should scroll sideways, and dialog controls should remain
+reachable. On a real phone, check keyboard entry, tapping BUZZ, QR scanning,
+and share/clipboard permissions. Those device checks remain manual.
+
+## Deployment (checklist step 22)
+
+See [DEPLOYMENT.md](../DEPLOYMENT.md) for the production environment template,
+Docker setup, optional Render recipe, persistent-disk requirements, Microsoft
+callback setup, and public acceptance checks.
+
+`npm run test:deployment` builds and smoke-tests the actual production Node
+server locally with disposable data, secure cookie/proxy simulation, WebSockets,
+and restart recovery. After publishing, run
+`npm run verify:deployment -- https://YOUR-SERVICE` to check public endpoints.
+Hosting and actual HTTPS/Microsoft sign-in/device checks must be completed
+before marking deployment finished. The local smoke test does not build Docker.
+
+## Production start
 
 ```bash
 npm run build

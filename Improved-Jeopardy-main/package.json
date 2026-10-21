@@ -9,7 +9,11 @@
     "server": "node Jeopardy/server/index.js",
     "setup": "npm install && npm --prefix Jeopardy install",
     "build": "npm --prefix Jeopardy run build",
-    "test": "node scripts/check-student-sessions.cjs",
+    "test:deployment": "npm run build && node scripts/check-deployment.cjs",
+    "test:database": "npm run build && node scripts/check-mongo.cjs",
+    "verify:deployment": "node scripts/check-public-deployment.cjs",
+    "test": "node scripts/check-student-sessions.cjs && npm --prefix Jeopardy run test:ui",
+    "test:mobile": "npm --prefix Jeopardy run test:ui",
     "test:teams": "node scripts/check-student-sessions.cjs",
     "test:sockets": "node scripts/check-student-sessions.cjs",
     "test:sync": "node scripts/check-student-sessions.cjs",
@@ -30,6 +34,10 @@
     "express": "^5.2.1",
     "express-session": "^1.19.0",
     "googleapis": "^182.0.0",
+    "mongodb": "^7.7.0",
     "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^11.3.0"
   }
 }

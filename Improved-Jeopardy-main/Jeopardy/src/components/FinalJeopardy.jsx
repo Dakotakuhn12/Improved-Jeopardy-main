@@ -1,4 +1,7 @@
+import useDialog from '../hooks/useDialog'
+
 export default function FinalJeopardy({ open, finalJeopardy, teams, scores, wagers, onWagerChange, revealed, onReveal, outcomes, onOutcomeChange, onResolve, onClose }) {
+  const dialogRef = useDialog(open, onClose)
   if (!open) return null
 
   const wagersAreValid = teams.every((team) => {
@@ -8,7 +11,7 @@ export default function FinalJeopardy({ open, finalJeopardy, teams, scores, wage
   const outcomesAreSet = teams.length > 0 && teams.every((team) => typeof outcomes[team.id] === 'boolean')
 
   return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-    <section className="clue-modal final-jeopardy-modal" role="dialog" aria-modal="true" aria-labelledby="final-jeopardy-heading" onMouseDown={(event) => event.stopPropagation()}>
+    <section ref={dialogRef} tabIndex={-1} className="clue-modal final-jeopardy-modal" role="dialog" aria-modal="true" aria-labelledby="final-jeopardy-heading" onMouseDown={(event) => event.stopPropagation()}>
       <button className="close" onClick={onClose} aria-label="Close Final Jeopardy">×</button>
       <p className="modal-category">FINAL JEOPARDY · {finalJeopardy.category}</p>
       <h2 id="final-jeopardy-heading">{finalJeopardy.question}</h2>
